@@ -2,16 +2,16 @@
  * 小红书笔记下载器 - Content Script(隔离环境)
  *
  * 功能:
- *  - 笔记页(/explore/xxx 等):显示「下载此笔记」按钮,下载当前笔记的图片/视频 + 笔记信息
+ *  - 笔记页:保存笔记和媒体，或自动加载评论回复并导出 Markdown/JSON
  *  - 博主主页(/user/profile/xxx):显示「下载该博主全部笔记」按钮,自动滚动收集全部笔记后逐篇下载
  *
  * 原理(不依赖需要签名的内部 API):
- *  1. 通过同源 fetch 请求笔记页 HTML(携带登录 Cookie 与 xsec_token)
- *  2. 从 HTML 中的 window.__INITIAL_STATE__ 提取笔记数据(新字段名 noteDetailMap)
+ *  1. 优先读取当前笔记的 MAIN world 状态，同源 HTML 请求作为回退
+ *  2. data.js 安全解析新版页面状态，严格匹配笔记 ID
  *  3. 批量下载的逐篇 xsec_token 由 main.js(MAIN world)从页面 state 读取回传
- *  4. 图片字节优先由 background 抓取(host_permissions 不受页面跨域限制),
+ *  4. 图片和视频通过 background 限时、限量抓取(host_permissions 不受页面跨域限制),
  *     CDN 返回的 webp/avif 转码为 jpg 后与视频一起用 zip.js 打包:xiaohongshu-标题-日期.zip
- *  5. zip 的 blob URL 发给 background.js 落盘,由 onDeterminingFilename 改名到子目录
+ *  5. ZIP 交给 background.js 落盘，等 Chrome 确认完成，再显示保存路径
  *     (Chrome 会忽略跨上下文 blob URL 下载的 filename 参数)
  */
 (() => {
@@ -39,6 +39,7 @@
   const ui = {
     root: null,
     btn: null,
+    commentsBtn: null,
     panel: null,
     title: null,
     status: null,
@@ -79,21 +80,8 @@
     return undefined;
   }
 
-  function sanitizeFilename(name, fallback = '未命名') {
-    let s = String(name ?? '')
-      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_') // 文件系统非法字符
-      .replace(/\s+/g, ' ')
-      .trim()
-      .replace(/[. ]+$/g, '');
-    if (s.length > 60) s = s.slice(0, 60);
-    return s || fallback;
-  }
-
-  /** CDN 直链带签名,按原样下载最稳,只处理协议相对地址 */
-  function normalizeUrl(url) {
-    if (url.startsWith('//')) return `https:${url}`;
-    return url;
-  }
+  const { sanitizeFilename, normalizeUrl, extractNoteId, parseNoteState, findNote,
+    normalizeNote, mergeComments, countComments, buildCommentsMarkdown } = XhsData;
 
   /** 按魔数判断真实图片格式,识别不了返回 null(XHS 的 CDN 会按内容协商返回 webp,URL 里看不出来) */
   function sniffImageExt(bytes) {
@@ -126,7 +114,8 @@
     let ext = sniffImageExt(data);
     if (!ext) {
       const m = /image\/(png|webp|avif|gif|jpeg)/i.exec(contentType || '');
-      ext = m ? (m[1] === 'jpeg' ? 'jpg' : m[1]) : 'jpg';
+      if (!m) throw new Error('CDN 返回的内容不是支持的图片');
+      ext = m[1] === 'jpeg' ? 'jpg' : m[1];
     }
     if (ext !== 'webp' && ext !== 'avif') return { ext, data };
     try {
@@ -155,11 +144,6 @@
     return null;
   }
 
-  function extractNoteId(url) {
-    const m = String(url).match(/\/(?:explore|discovery\/item|search_result)\/([0-9a-zA-Z]{16,64})/);
-    return m ? m[1] : null;
-  }
-
   // ---------- MAIN world 桥接(读取页面 state) ----------
 
   const MAIN_REQUEST_EVENT = 'xhs-dl-request';
@@ -170,7 +154,7 @@
    * 调用 main.js 提供的能力。返回 data;超时或失败返回 null。
    * @param {string} kind 请求类型
    */
-  function callMainWorld(kind) {
+  function callMainWorld(kind, args = {}) {
     return new Promise((resolve) => {
       const reqId = `r${Date.now()}_${(mainReqSeq += 1)}`;
       const cleanup = () => {
@@ -194,178 +178,89 @@
       }, MAIN_TIMEOUT_MS);
       document.addEventListener(MAIN_RESPONSE_EVENT, onResponse);
       document.dispatchEvent(
-        new CustomEvent(MAIN_REQUEST_EVENT, { detail: JSON.stringify({ reqId, kind }) })
+        new CustomEvent(MAIN_REQUEST_EVENT, { detail: JSON.stringify({ ...args, reqId, kind }) })
       );
     });
   }
 
-  // ---------- 解析笔记页 __INITIAL_STATE__ ----------
+  // ---------- 获取笔记数据 ----------
 
-  /**
-   * 用括号配平的方式截取 window.__INITIAL_STATE__ = {...} 的 JSON 字符串。
-   * 比正则到 </script> 更稳:不受脚本尾部附带代码影响。
-   */
-  function extractStateJson(html) {
-    const key = 'window.__INITIAL_STATE__';
-    const keyIdx = html.indexOf(key);
-    if (keyIdx === -1) return null;
-    const start = html.indexOf('{', keyIdx);
-    if (start === -1) return null;
-    let depth = 0;
-    let inStr = false;
-    let quote = '';
-    for (let i = start; i < html.length; i += 1) {
-      const c = html[i];
-      if (inStr) {
-        if (c === quote && html[i - 1] !== '\\') inStr = false;
-        continue;
-      }
-      if (c === '"' || c === "'") {
-        inStr = true;
-        quote = c;
-        continue;
-      }
-      if (c === '{') depth += 1;
-      else if (c === '}') {
-        depth -= 1;
-        if (depth === 0) return html.slice(start, i + 1);
-      }
-    }
-    return null;
-  }
-
-  /**
-   * 解析出 state 对象。
-   * 页面序列化的 JSON 里可能出现裸 undefined 关键字,需要替换成 null 再 parse。
-   */
-  function parseNoteState(html) {
-    const raw = extractStateJson(html);
-    if (!raw) return null;
-    const attempts = [
-      raw,
-      raw.replace(/([{,:\[]\s*)undefined(\s*[,}\]])/g, '$1null$2'),
-      raw.replace(/\bundefined\b/g, 'null'),
-    ];
-    for (const text of attempts) {
-      try {
-        return JSON.parse(text);
-      } catch (_) {
-        // 尝试下一种替换策略
-      }
-    }
-    return null;
-  }
-
-  function pickImageUrl(img) {
-    const infoList = pick(img, 'infoList', 'info_list');
-    const raw =
-      pick(img, 'urlDefault', 'url_default') ||
-      (Array.isArray(infoList) && infoList.length ? infoList[infoList.length - 1].url : undefined);
-    return raw ? normalizeUrl(raw) : null;
-  }
-
-  function pickVideoUrl(note) {
-    const stream = note?.video?.media?.stream || {};
-    for (const codec of ['h264', 'h265', 'av1']) {
-      const arr = stream[codec];
-      const item = Array.isArray(arr) ? arr[0] : null;
-      const url = item ? pick(item, 'masterUrl', 'master_url') : null;
-      if (url) return { url: normalizeUrl(url), codec };
-    }
-    return null;
-  }
-
-  function normalizeNote(note, noteUrl) {
-    const images = [];
-    for (const img of note.imageList || []) {
-      const url = pickImageUrl(img);
-      if (url) images.push({ url });
-    }
-    const video = pickVideoUrl(note);
-    const tagList = pick(note, 'tagList', 'tag_list');
-    const user = note.user || {};
-    return {
-      noteId: String(pick(note, 'noteId', 'note_id') || extractNoteId(noteUrl) || ''),
-      title: note.title || '',
-      desc: note.desc || '',
-      type: note.type || (video ? 'video' : 'normal'),
-      author: pick(user, 'nickname', 'nick_name') || '未知博主',
-      authorId: pick(user, 'userId', 'user_id') || '',
-      time: Number(note.time || 0),
-      tags: (Array.isArray(tagList) ? tagList : []).map((t) => t.name).filter(Boolean),
-      images,
-      video,
-      url: noteUrl,
-    };
-  }
-
-  /**
-   * 获取一篇笔记的完整数据(标题/正文/图片/视频)。
-   * @param {string} noteUrl 笔记页地址,必须携带 xsec_token(裸链接拿到的是空数据)
-   */
   async function fetchNoteData(noteUrl) {
-    const res = await fetch(noteUrl, { credentials: 'include' });
-    if (!res.ok) throw new Error(`请求失败 HTTP ${res.status}`);
-    const html = await res.text();
-    const data = parseNoteState(html);
-    if (!data) throw new Error('页面数据解析失败(可能未登录或页面结构变化)');
-
-    // 新版字段名是 noteDetailMap,旧版是 noteDataMap,两者都兼容
-    const noteMap = data?.note?.noteDetailMap || data?.note?.noteDataMap || {};
-    const keys = Object.keys(noteMap);
-    if (!keys.length) {
-      throw new Error('笔记数据为空(链接可能缺少 xsec_token,请从博主页或推荐流中打开)');
-    }
     const noteId = extractNoteId(noteUrl);
-    let entry = noteMap[noteId];
-    if (!entry?.note) entry = noteMap[keys[0]];
-    const note = entry?.note;
-    if (!note || (!note.imageList && !note.video)) {
-      throw new Error('笔记内容为空(可能已删除、仅自己可见或需要验证)');
+    if (!noteId) throw new Error('无法识别笔记 ID，请从推荐流或博主主页打开笔记');
+    // SPA 弹层已经加载的数据比重新请求 SSR 页面可靠，并且不需要重新取得 token。
+    if (extractNoteId(location.href) === noteId) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const current = await callMainWorld('current-note', { noteId });
+        if (current?.note?.noteId === noteId) return current.note;
+        if (state.cancelled) throw new Error('已取消');
+        await sleep(300);
+      }
     }
-    return normalizeNote(note, noteUrl);
+    const res = await fetch(noteUrl, {
+      credentials: 'include', signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) throw new Error(`请求失败 HTTP ${res.status}`);
+    const data = parseNoteState(await res.text());
+    if (!data) throw new Error('页面数据解析失败，请确认已登录且完成网页验证后重试');
+    const entry = findNote(data, noteId);
+    if (!entry) throw new Error('未取得这篇笔记的数据，请从推荐流或博主主页重新打开（链接可能缺少 xsec_token）');
+    return normalizeNote(entry.note, noteUrl);
   }
 
   // ---------- 下载(zip 打包) ----------
 
-  /**
-   * 抓取媒体文件的字节(强制 https,CDN 签名直链无需 Cookie,实测允许跨域)。
-   * @returns {Promise<{data: Uint8Array, contentType: string}>}
-   */
-  async function fetchBytes(url) {
-    const u = url.startsWith('//') ? `https:${url}` : url.replace(/^http:\/\//i, 'https:');
-    const resp = await fetch(u, { credentials: 'omit' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const buf = await resp.arrayBuffer();
-    if (!buf.byteLength) throw new Error('内容为空');
-    return { data: new Uint8Array(buf), contentType: resp.headers.get('content-type') || '' };
-  }
-
+  /** 解码后台返回的媒体字节。 */
   function base64ToBytes(b64) {
     const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-    return bytes;
+    return Uint8Array.from(bin, (char) => char.charCodeAt(0));
   }
 
-  /**
-   * 抓取图片字节:优先交给 background 的 Service Worker 抓取
-   * (配合 host_permissions 不受页面跨域限制,参照「小红书采集助手」的实现),
-   * 失败时回退为页面内直接 fetch(CDN 允许跨域)。
-   * @returns {Promise<{data: Uint8Array, contentType: string}>}
-   */
-  async function fetchImageBytes(url) {
-    const u = url.startsWith('//') ? `https:${url}` : url.replace(/^http:\/\//i, 'https:');
-    try {
-      const res = await chrome.runtime.sendMessage({ type: 'fetch-image', url: u });
-      if (res && res.ok && typeof res.b64 === 'string') {
-        return { data: base64ToBytes(res.b64), contentType: res.contentType || '' };
-      }
-      throw new Error((res && res.error) || '后台抓取无响应');
-    } catch (_) {
-      // 回退:页面内直接抓取
-      return fetchBytes(u);
+  async function fetchMediaBytes(url, image = false) {
+    const u = normalizeUrl(url);
+    if (!u) throw new Error('不支持的媒体地址');
+    const res = await chrome.runtime.sendMessage({ type: image ? 'fetch-image' : 'fetch-media', url: u });
+    if (!res?.ok) throw new Error(res?.error || '后台抓取无响应，请刷新页面后重试');
+    if (typeof res.b64 === 'string') {
+      return { data: base64ToBytes(res.b64), contentType: res.contentType || '' };
     }
+    if (!res.transferId || !Number.isSafeInteger(res.byteLength) || res.byteLength > 256 * 1024 * 1024) {
+      throw new Error('无效的媒体传输');
+    }
+    try {
+      const data = new Uint8Array(res.byteLength);
+      let offset = 0;
+      while (offset < data.length) {
+        if (state.cancelled) throw new Error('已取消');
+        const chunk = await chrome.runtime.sendMessage({
+          type: 'fetch-media-chunk', transferId: res.transferId, offset,
+        });
+        if (!chunk?.ok || typeof chunk.b64 !== 'string') throw new Error(chunk?.error || '媒体传输失败');
+        const bytes = base64ToBytes(chunk.b64);
+        if (!bytes.length || offset + bytes.length > data.length || chunk.nextOffset !== offset + bytes.length) {
+          throw new Error('媒体分块损坏');
+        }
+        data.set(bytes, offset);
+        offset += bytes.length;
+      }
+      return { data, contentType: res.contentType || '' };
+    } finally {
+      await chrome.runtime.sendMessage({ type: 'release-media', transferId: res.transferId }).catch(() => {});
+    }
+  }
+
+  const fetchImageBytes = (url) => fetchMediaBytes(url, true);
+
+  async function waitForDownload(downloadId) {
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      const result = await chrome.runtime.sendMessage({ type: 'download-state', downloadId });
+      if (!result?.ok) throw new Error(result?.error || '无法查询下载状态');
+      if (result.state === 'complete') return;
+      if (result.state === 'interrupted') throw new Error(`下载中断：${result.error || '请检查下载栏'}`);
+      await sleep(250);
+    }
+    throw new Error('下载仍未完成，请检查 Chrome 下载栏');
   }
 
   /**
@@ -377,11 +272,17 @@
    */
   async function saveZip(blob, savePath) {
     const blobUrl = URL.createObjectURL(blob);
+    let accepted = false;
     try {
       const res = await chrome.runtime.sendMessage({ type: 'download', url: blobUrl, filename: savePath });
-      if (res && res.ok && typeof res.downloadId === 'number') return res.downloadId;
+      if (res && res.ok && typeof res.downloadId === 'number') {
+        accepted = true;
+        await waitForDownload(res.downloadId);
+        return res.downloadId;
+      }
       throw new Error((res && res.error) || '下载失败');
     } catch (e) {
+      if (accepted) throw e;
       // 兜底:页面锚点直接下载(zip 文件名保留,但落在默认下载目录、不支持子目录)
       try {
         const a = document.createElement('a');
@@ -406,7 +307,7 @@
    * @param {Array<{path: string}>} imgEntries 已抓取的图片条目
    * @param {{path: string}|null} videoEntry 视频条目
    */
-  function buildMarkdown(n, imgEntries, videoEntry) {
+  function buildMarkdown(n, imgEntries, videoEntry, archive = null, errors = []) {
     const date = n.time ? new Date(n.time).toLocaleString('zh-CN', { hour12: false }) : '';
     const lines = [];
     lines.push(`# ${n.title || '无标题'}`, '');
@@ -420,6 +321,8 @@
       imgEntries.forEach((e, i) => lines.push(`![${n.video && i === 0 ? '封面' : `图片${i + 1}`}](images/${e.path})`));
       if (videoEntry) lines.push('', `[视频](video.mp4)`);
     }
+    if (archive) lines.push('', '## 评论', '', `[阅读评论](评论.md) · [结构化数据](评论.json)`, '', `已保存 ${countComments(archive.comments)} 条评论（含回复）；${archive.complete ? '页面可加载评论已收集完成' : `部分保存：${archive.reason}`}。`);
+    if (errors.length) lines.push('', '## 未保存的媒体', '', ...errors.map((e) => `- ${e}`));
     lines.push('', `> 由「小红书笔记下载器」导出于 ${new Date().toLocaleString('zh-CN', { hour12: false })}`);
     return lines.join('\n');
   }
@@ -430,24 +333,25 @@
    * @param {number|null} index 批量下载时的序号;单篇下载传 null
    * @returns {{errors: string[], downloadId: number|null}} 失败项列表与下载任务 ID
    */
-  async function downloadNote(note, index) {
+  async function downloadNote(note, index, archive = null) {
     const date = fmtYMD(note.time || Date.now()); // 发布日期,缺失时用当天
     const title = sanitizeFilename(note.title || note.noteId);
-    const zipName = `xiaohongshu-${title}-${date}.zip`;
+    const zipName = `xiaohongshu-${title}-${date}${archive ? "-含评论" : ""}.zip`;
     const prefix = index ? `${pad3(index)}_` : '';
     const savePath = `${ROOT_DIR}/${sanitizeFilename(note.author)}/${prefix}${zipName}`;
     const errors = [];
+    if (note.type === 'video' && !note.video) errors.push('视频（网页未提供可识别的视频流，请刷新页面后重试）');
 
     // 1) 抓取图片字节(优先经 background 抓取;webp/avif 自动转码为 jpg,保证双击可打开)
     const imgEntries = [];
     let i = 0;
     for (const img of note.images) {
-      if (state.cancelled) return errors;
+      if (state.cancelled) return { errors, downloadId: null };
       i += 1;
       try {
         const { data, contentType } = await fetchImageBytes(img.url);
         const file = await toOpenableImage(data, contentType);
-        const name = note.video && i === 1 ? `cover.${file.ext}` : `${pad2(i)}.${file.ext}`;
+        const name = (note.video || note.type === 'video') && i === 1 ? `cover.${file.ext}` : `${pad2(i)}.${file.ext}`;
         imgEntries.push({ path: name, data: file.data });
       } catch (e) {
         errors.push(`图${i}(${e.message})`);
@@ -458,20 +362,34 @@
     // 2) 抓取视频字节(视频笔记)
     let videoEntry = null;
     if (note.video && !state.cancelled) {
-      try {
-        videoEntry = { path: 'video.mp4', data: (await fetchBytes(note.video.url)).data };
-      } catch (e) {
-        errors.push(`视频(${e.message})`);
+      let failure;
+      for (const url of [note.video.url, ...(note.video.backupUrls || [])]) {
+        if (state.cancelled) break;
+        try {
+          videoEntry = { path: 'video.mp4', data: (await fetchMediaBytes(url)).data };
+          break;
+        } catch (e) {
+          failure = e;
+        }
       }
+      if (!videoEntry && !state.cancelled) errors.push(`视频(${failure?.message || '没有可下载的视频'})`);
     }
-    if (state.cancelled) return errors;
+    if (state.cancelled) return { errors, downloadId: null };
 
     // 3) 组装 zip 条目:markdown 引用 images/ 与 video.mp4 的实际文件名
     const files = [
-      { name: `${title}.md`, data: new TextEncoder().encode(buildMarkdown(note, imgEntries, videoEntry)) },
+      { name: archive ? '笔记.md' : `${title}.md`, data: new TextEncoder().encode(buildMarkdown(note, imgEntries, videoEntry, archive, errors)) },
       ...imgEntries.map((e) => ({ name: `images/${e.path}`, data: e.data })),
     ];
-    if (videoEntry) files.push(videoEntry);
+    if (videoEntry) files.push({ name: videoEntry.path, data: videoEntry.data });
+    if (archive) {
+      const encoder = new TextEncoder();
+      files.push(
+        { name: '评论.md', data: encoder.encode(buildCommentsMarkdown(archive)) },
+        { name: '评论.json', data: encoder.encode(JSON.stringify(archive, null, 2)) },
+        { name: '笔记.json', data: encoder.encode(JSON.stringify({ schemaVersion: 1, ...note, exportedAt: archive.exportedAt, mediaErrors: errors }, null, 2)) },
+      );
+    }
 
     // 4) 打包下载(background 通过 onDeterminingFilename 落到「小红书下载/博主/」子目录)
     let downloadId = null;
@@ -511,6 +429,7 @@
    * @returns {Promise<Array<{noteId, xsecToken, title}>>}
    */
   async function collectProfileNotes() {
+    const profilePath = location.pathname;
     const initial = await callMainWorld('profile-notes');
     if (!initial) {
       throw new Error('无法读取页面笔记列表(需要 Chrome 111+,或页面未加载完成,请刷新后重试)');
@@ -520,11 +439,14 @@
     let last = items.length;
     let stale = 0;
     while (stale < STALE_ROUNDS_LIMIT && !state.cancelled) {
+      if (location.pathname !== profilePath) throw new Error('页面已切换，请回到原博主主页后重新下载');
       container.scrollTop = container.scrollHeight;
       window.scrollTo(0, document.documentElement.scrollHeight);
       await sleep(SCROLL_WAIT_MS);
+      if (location.pathname !== profilePath) throw new Error('页面已切换，请回到原博主主页后重新下载');
       const next = await callMainWorld('profile-notes');
-      if (next) items = dedupeById(next);
+      if (location.pathname !== profilePath) throw new Error('页面已切换，请回到原博主主页后重新下载');
+      if (next) items = dedupeById([...items, ...next]);
       setStatus(`正在滚动收集笔记… 已发现 ${items.length} 篇`);
       if (items.length === last) stale += 1;
       else {
@@ -542,10 +464,89 @@
     return `${location.origin}/explore/${item.noteId}?xsec_token=${encodeURIComponent(item.xsecToken)}&xsec_source=pc_user`;
   }
 
+  // ---------- 通过网页自身加载评论和回复 ----------
+  function pendingReplies(comments) {
+    return comments.some((c) => c.hasMoreReplies || c.replies.length < c.replyCount || pendingReplies(c.replies));
+  }
+
+  function commentScrollContainer() {
+    let el = [...document.querySelectorAll('.comments-container')].find(isVisible);
+    while (el && el !== document.documentElement) {
+      if (/(auto|scroll)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight + 10) return el;
+      el = el.parentElement;
+    }
+    return [...document.querySelectorAll('.note-container')].find(isVisible) || document.scrollingElement;
+  }
+
+  function commentExpandButtons() {
+    const root = [...document.querySelectorAll('.comments-container')].find(isVisible);
+    if (!root) return [];
+    return [...root.querySelectorAll('button, [role="button"], [class*="more"], [class*="expand"]')]
+      .filter((el) => isVisible(el) && el.textContent.trim().length < 60 && /展开|更多|查看.*回复/.test(el.textContent))
+      .filter((el, _, all) => !all.some((other) => other !== el && el.contains(other)));
+  }
+
+  async function collectComments(note) {
+    const container = commentScrollContainer();
+    const originalTop = container?.scrollTop || 0;
+    const archive = {
+      schemaVersion: 1, noteId: note.noteId, noteUrl: note.url,
+      exportedAt: new Date().toISOString(), reportedTotal: null,
+      complete: false, reason: '', comments: [],
+    };
+    const deadline = Date.now() + 180000;
+    let stale = 0;
+    let previousSignature = '';
+    try {
+      for (let round = 0; round < 300 && Date.now() < deadline; round += 1) {
+        if (state.cancelled) throw new Error('已取消');
+        if (extractNoteId(location.href) !== note.noteId) throw new Error('页面已切换，请回到原笔记后重新保存');
+        const snapshot = await callMainWorld('note-comments', { noteId: note.noteId });
+        if (!snapshot) {
+          archive.reason = '无法读取评论状态，请刷新页面后重试';
+          break;
+        }
+        archive.comments = mergeComments(archive.comments, snapshot.comments || []);
+        archive.reportedTotal = snapshot.reportedTotal ?? archive.reportedTotal;
+        const count = countComments(archive.comments);
+        setStatus(`正在收集评论和回复… 已读取 ${count} 条${archive.reportedTotal !== null ? ` / 页面显示 ${archive.reportedTotal} 条` : ''}`);
+        const moreReplies = pendingReplies(archive.comments);
+        const total = /^\d+$/.test(String(archive.reportedTotal)) ? Number(archive.reportedTotal) : null;
+        if (snapshot.loaded === true && snapshot.hasMore === false && !snapshot.loading && !moreReplies && (total === null || count >= total)) {
+          archive.complete = true;
+          break;
+        }
+        if (count >= 10000) {
+          archive.reason = '已达到单次 10000 条评论的收集上限';
+          break;
+        }
+        const signature = `${count}:${snapshot.hasMore}:${moreReplies}`;
+        stale = signature === previousSignature && !snapshot.loading ? stale + 1 : 0;
+        previousSignature = signature;
+        if (stale >= 8) {
+          archive.reason = moreReplies ? '仍有回复未能加载（可能被折叠、删除或网页限制）' : '网页没有继续返回评论，可能存在删除、隐藏或加载限制';
+          break;
+        }
+        const buttons = commentExpandButtons();
+        // 每轮最多展开一处，沿用网站自身请求签名及加载逻辑。
+        if (buttons.length) buttons[round % buttons.length].click();
+        if (container) container.scrollTop = container.scrollHeight;
+        await sleep(900);
+      }
+      if (!archive.complete && !archive.reason) archive.reason = '已达到 3 分钟或 300 轮的加载上限';
+      return archive;
+    } finally {
+      if (container?.isConnected && extractNoteId(location.href) === note.noteId) container.scrollTop = originalTop;
+    }
+  }
+
   // ---------- UI ----------
 
   function ensureUI() {
-    if (ui.root) return;
+    if (ui.root) {
+      if (!ui.root.isConnected) (document.body || document.documentElement).appendChild(ui.root);
+      return;
+    }
     const root = document.createElement('div');
     root.id = 'xhs-dl-root';
     root.innerHTML = `
@@ -563,7 +564,10 @@
           <button class="xhs-dl-cancel">取消下载</button>
         </div>
       </div>
-      <button class="xhs-dl-btn" hidden>下载</button>
+      <div class="xhs-dl-trigger-actions">
+        <button class="xhs-dl-btn xhs-dl-note-btn" hidden>下载</button>
+        <button class="xhs-dl-btn xhs-dl-comments-btn" hidden>⬇ 保存笔记＋评论</button>
+      </div>
     `;
     (document.body || document.documentElement).appendChild(root);
 
@@ -577,7 +581,8 @@
     ui.path = root.querySelector('.xhs-dl-path');
     ui.open = root.querySelector('.xhs-dl-open');
     ui.cancel = root.querySelector('.xhs-dl-cancel');
-    ui.btn = root.querySelector('.xhs-dl-btn');
+    ui.btn = root.querySelector('.xhs-dl-note-btn');
+    ui.commentsBtn = root.querySelector('.xhs-dl-comments-btn');
 
     root.querySelector('.xhs-dl-close').addEventListener('click', () => {
       ui.panel.hidden = true; // 仅隐藏面板,不中断进行中的任务
@@ -622,6 +627,7 @@
         ui.panel.hidden = true;
       }
     });
+    ui.commentsBtn.addEventListener('click', () => runSingleDownload(true));
     ui.btn.addEventListener('click', () => {
       const type = getPageType();
       if (type === 'profile') runBatchDownload();
@@ -633,56 +639,63 @@
    * 在笔记页「关注」按钮旁注入内联下载按钮。
    * 注意:页面 DOM 里可能同时存在一份隐藏的备用布局(display:none 的 .author 副本),
    * 必须挑「可见」的关注按钮作锚点,否则按钮会被藏进不可见容器里。
-   * 页面是 React 渲染,重渲染可能移除按钮,由轮询定时器持续补挂。
+   * 页面重渲染可能移除按钮,由轮询定时器持续补挂。
    * @returns {boolean} 内联按钮当前是否存在于页面
    */
   function ensureInlineButton() {
-    if (getPageType() !== 'note') return false;
-    const anchor = [...document.querySelectorAll('.note-detail-follow-btn')].find(isVisible);
-    let btn = document.querySelector('.xhs-dl-inline-btn');
-    if (btn && anchor && btn.previousElementSibling !== anchor) {
-      btn.remove(); // 挂在了隐藏副本旁,摘下来重新挂到可见锚点
-      btn = null;
-    }
-    if (btn) {
-      syncInlineButton();
-      return true;
-    }
-    if (!anchor || !anchor.parentElement) {
-      syncInlineButton();
+    let group = document.querySelector('.xhs-dl-inline-actions');
+    if (getPageType() !== 'note') {
+      group?.remove();
       return false;
     }
-    btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'xhs-dl-inline-btn';
-    btn.title = '下载这篇笔记(图片/视频 + markdown,打包为 zip)';
-    btn.addEventListener('click', () => runSingleDownload());
-    anchor.insertAdjacentElement('afterend', btn);
+    const anchor = [...document.querySelectorAll('.note-detail-follow-btn, .author-container .follow-button')].find(isVisible);
+    // 空间不够时用浮动按钮，避免把网页作者信息挤出容器。
+    const room = anchor?.parentElement?.getBoundingClientRect().width || 0;
+    if (!anchor || !anchor.parentElement || room < 500) {
+      group?.remove();
+      return false;
+    }
+    if (group && group.previousElementSibling !== anchor) {
+      group.remove();
+      group = null;
+    }
+    if (!group) {
+      group = document.createElement('div');
+      group.className = 'xhs-dl-inline-actions';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'xhs-dl-inline-btn';
+      btn.title = '保存图片、视频和笔记正文，打包为 ZIP';
+      btn.addEventListener('click', () => runSingleDownload());
+      const commentsBtn = document.createElement('button');
+      commentsBtn.type = 'button';
+      commentsBtn.className = 'xhs-dl-inline-btn xhs-dl-inline-comments';
+      commentsBtn.title = '自动加载评论与回复，保存 Markdown 和 JSON，打包为 ZIP';
+      commentsBtn.addEventListener('click', () => runSingleDownload(true));
+      group.append(btn, commentsBtn);
+      anchor.insertAdjacentElement('afterend', group);
+    }
     syncInlineButton();
     return true;
   }
 
-  /** 同步内联按钮的文案与禁用状态 */
   function syncInlineButton() {
-    const btn = document.querySelector('.xhs-dl-inline-btn');
-    if (!btn) return;
-    btn.disabled = state.running;
-    btn.textContent = state.running ? '下载中…' : '⬇ 下载笔记';
+    document.querySelectorAll('.xhs-dl-inline-btn').forEach((btn) => {
+      btn.disabled = state.running;
+      btn.textContent = state.running ? '保存中…' : btn.classList.contains('xhs-dl-inline-comments') ? '⬇ 保存笔记＋评论' : '⬇ 下载笔记';
+    });
   }
 
   function refreshButton() {
     const type = getPageType();
-    // 以「内联按钮真实可见」为准:若它被藏进隐藏布局,浮动按钮兜底显示,避免两者都不可见
-    const hasInline = type === 'note' && isVisible(document.querySelector('.xhs-dl-inline-btn'));
+    const hasInline = type === 'note' && isVisible(document.querySelector('.xhs-dl-inline-actions'));
     syncInlineButton();
-    if (!type || hasInline) {
-      // 非笔记/主页页面,或笔记页已有可见内联按钮时,隐藏右下角浮动按钮
-      ui.btn.hidden = true;
-      return;
-    }
-    ui.btn.hidden = false;
+    ui.btn.hidden = !type || hasInline;
+    ui.commentsBtn.hidden = type !== 'note' || hasInline;
     ui.btn.disabled = state.running;
-    ui.btn.textContent = type === 'profile' ? '⬇ 下载该博主全部笔记' : '⬇ 下载此笔记';
+    ui.commentsBtn.disabled = state.running;
+    ui.btn.textContent = type === 'profile' ? '⬇ 下载该博主全部笔记' : '⬇ 下载笔记';
+    ui.commentsBtn.textContent = state.running ? '保存中…' : '⬇ 保存笔记＋评论';
   }
 
   function resetPanel(title) {
@@ -735,7 +748,7 @@
     } else {
       ui.cancel.hidden = false;
       ui.cancel.disabled = false;
-      ui.cancel.textContent = '完成 ✓(点击关闭)';
+      ui.cancel.textContent = '关闭';
     }
   }
 
@@ -767,18 +780,26 @@
   // ---------- 主流程 ----------
 
   /** 下载当前打开的单篇笔记 */
-  async function runSingleDownload() {
+  async function runSingleDownload(withComments = false) {
     if (state.running) return;
     state.running = true;
     state.cancelled = false;
-    resetPanel('下载当前笔记');
+    resetPanel(withComments ? '保存笔记＋评论' : '下载当前笔记');
     refreshButton();
     let downloadId = null;
     try {
       setStatus('正在获取笔记数据…');
       const note = await fetchNoteData(location.href);
       log(`《${note.title || note.noteId}》 ${note.images.length} 张图片${note.video ? ' + 1 个视频' : ''}`);
-      const result = await downloadNote(note, null);
+      let archive = null;
+      if (withComments) {
+        log('正在通过网页加载评论和回复，请保持当前笔记打开…');
+        archive = await collectComments(note);
+        log(`已收集 ${countComments(archive.comments)} 条评论（含回复）`);
+        if (!archive.complete) log(`⚠ 评论部分保存：${archive.reason}`, 'warn');
+      }
+      setStatus('正在保存媒体并打包…');
+      const result = await downloadNote(note, null, archive);
       downloadId = result.downloadId;
       result.errors.forEach((e) => log(`⚠ ${e}`, 'warn'));
       setStatus(
@@ -786,14 +807,14 @@
           ? '已取消'
           : result.errors.length
             ? `完成,但有 ${result.errors.length} 个文件失败(详见日志)`
-            : '✅ 下载完成'
+            : archive && !archive.complete ? '✅ 已保存笔记和部分评论（详见日志）' : '✅ 下载完成'
       );
       if (downloadId !== null) {
         const p = await queryDownloadPath(downloadId);
         if (p) showPath(`已保存到:${p}`);
       }
     } catch (e) {
-      setStatus(`❌ 失败:${e.message}`);
+      setStatus(state.cancelled ? '已取消' : `❌ 失败:${e.message}`);
       log(e.message, 'err');
     } finally {
       state.running = false;
@@ -811,7 +832,9 @@
     refreshButton();
     let ok = 0;
     let fail = 0;
+    let saved = 0;
     let lastDownloadId = null;
+    const profilePath = location.pathname;
     try {
       setStatus('正在滚动页面收集笔记…(请保持本页面在前台)');
       const items = await collectProfileNotes();
@@ -827,6 +850,7 @@
       setProgress(0, items.length);
 
       for (let i = 0; i < items.length; i += 1) {
+        if (location.pathname !== profilePath) throw new Error('页面已切换，已停止批量下载');
         if (state.cancelled) {
           log('已取消,停止后续下载', 'warn');
           break;
@@ -837,13 +861,18 @@
           const note = await fetchNoteData(buildNoteUrl(item));
           setStatus(`(${i + 1}/${items.length}) 《${trunc(note.title || item.title || item.noteId)}》`);
           const result = await downloadNote(note, i + 1);
-          if (result.downloadId !== null) lastDownloadId = result.downloadId;
+          if (state.cancelled && result.downloadId === null) break;
+          if (result.downloadId !== null) {
+            lastDownloadId = result.downloadId;
+            saved += 1;
+          }
           if (result.errors.length) {
             fail += 1;
             log(`⚠ 《${trunc(note.title || item.title || item.noteId)}》:${result.errors.join('; ')}`, 'warn');
           } else {
             ok += 1;
           }
+          if (state.cancelled) break;
         } catch (e) {
           fail += 1;
           log(`✗ (${i + 1}/${items.length}) ${e.message}`, 'err');
@@ -852,21 +881,21 @@
             await sleep(5000);
           }
         }
-        await sleep(NOTE_FETCH_INTERVAL_MS + Math.random() * 400);
+        if (!state.cancelled) await sleep(NOTE_FETCH_INTERVAL_MS + Math.random() * 400);
       }
 
-      setProgress(items.length, items.length);
+      if (!state.cancelled) setProgress(items.length, items.length);
       setStatus(
         state.cancelled
           ? `已取消:成功 ${ok} 篇,失败 ${fail} 篇`
           : `✅ 完成:成功 ${ok} 篇,失败 ${fail} 篇,共 ${items.length} 篇`
       );
-      if (lastDownloadId !== null && ok + fail > 0) {
+      if (lastDownloadId !== null && saved > 0) {
         const p = await queryDownloadPath(lastDownloadId);
-        if (p) showPath(`保存目录:${dirname(p)}(共 ${ok + fail} 个文件)`);
+        if (p) showPath(`保存目录:${dirname(p)}(共 ${saved} 个 ZIP 文件)`);
       }
     } catch (e) {
-      setStatus(`❌ 失败:${e.message}`);
+      setStatus(state.cancelled ? '已取消' : `❌ 失败:${e.message}`);
       log(e.message, 'err');
     } finally {
       state.running = false;
@@ -880,7 +909,7 @@
   setInterval(() => {
     if (location.href !== lastHref) lastHref = location.href; // 小红书是 SPA,pushState 切页不刷新
     ensureUI();
-    ensureInlineButton(); // 笔记页「关注」旁的内联按钮(React 重渲染后自动补挂)
+    ensureInlineButton(); // 页面重渲染后自动补挂按钮
     refreshButton();
   }, URL_WATCH_INTERVAL_MS);
   ensureUI();

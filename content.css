@@ -13,6 +13,25 @@
 #xhs-dl-root * {
   box-sizing: border-box;
 }
+.xhs-dl-trigger-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: calc(100vw - 32px);
+}
+.xhs-dl-inline-actions {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-left: 8px;
+}
+.xhs-dl-inline-actions .xhs-dl-inline-btn {
+  margin-left: 0;
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+}
 
 /* 触发按钮(右下角浮动,用于博主主页及笔记页兜底) */
 .xhs-dl-btn {
@@ -71,6 +90,7 @@
 /* 进度面板 */
 .xhs-dl-panel {
   width: 320px;
+  max-width: calc(100vw - 32px);
   background: rgba(24, 24, 28, 0.95);
   color: #f3f3f5;
   border-radius: 12px;

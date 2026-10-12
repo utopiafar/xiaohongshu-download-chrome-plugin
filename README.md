@@ -6,7 +6,7 @@
 
 | 场景 | 操作 |
 | --- | --- |
-| 打开某篇笔记(`/explore/xxx`) | 笔记页面右上方「关注」按钮旁边出现「⬇ 下载笔记」按钮,点击下载该笔记 |
+| 打开某篇笔记(`/explore/xxx` 等) | 「⬇ 下载笔记」保存笔记和媒体；「⬇ 保存笔记＋评论」同时保存评论及回复。空间不足时按钮显示在右下角 |
 | 打开博主主页(`/user/profile/xxx`) | 页面右下角出现「⬇ 下载该博主全部笔记」按钮,点击后自动滚动收集全部笔记并逐篇下载 |
 
 下载完成后,进度面板会显示**完整保存路径**,主按钮自动变为「📂 打开目录」,一键在系统文件管理器(macOS Finder / Windows 资源管理器)中定位到文件(面板通过右上角 × 关闭)。
@@ -33,6 +33,24 @@ xiaohongshu-你好-20260930.zip
 
 单篇下载时 zip 直接放在博主文件夹下,没有序号前缀。markdown 里图片/视频用相对路径引用,在 Typora、Obsidian 等编辑器中打开 `.md` 即可图文混排。
 
+## 保存笔记＋评论（v1.4.0）
+
+点击新增按钮后，插件读取当前已打开的笔记，自动滚动评论区域，并逐次展开回复。沿用网页自身的加载逻辑，无需 API Key 或额外登录授权。收集结束后恢复评论区原来的滚动位置。
+
+```
+xiaohongshu-标题-发布日期-含评论.zip
+├── 笔记.md            # 图文正文，附评论文件链接和媒体失败说明
+├── 笔记.json          # 笔记元数据和媒体来源
+├── 评论.md            # 主评论与回复层级，昵称、时间、点赞数、地区
+├── 评论.json          # schemaVersion=1，评论 ID、parentId、replyTo 与嵌套 replies
+├── images/            # 笔记图片或视频封面
+└── video.mp4          # 视频笔记
+```
+
+`评论.json` 同时记录 `exportedAt`、`reportedTotal`、`complete` 和 `reason`，便于判断归档范围；已加载评论与回复按 ID 去重。评论中的图片保留在线链接，不下载头像和评论图片。
+
+只保存当前账号通过网页可以加载的内容；被删除、隐藏或后续新增的评论不会包含在归档中。遇到加载停滞、未展开回复，或达到单次 3 分钟 / 10000 条的收集上限时，会保存已取得的评论并明确标注“部分保存”。点击“取消下载”停止本次任务；离开原笔记会停止评论收集，避免保存其他笔记的评论。批量博主下载仍只保存笔记和媒体。
+
 ## 安装
 
 1. 打开 Chrome,访问 `chrome://extensions/`
@@ -42,13 +60,13 @@ xiaohongshu-你好-20260930.zip
 
 ## 工作原理
 
-- 插件通过页面同源 `fetch` 请求笔记页 HTML(自动携带登录 Cookie 和 `xsec_token`)
-- 从 HTML 中的 `window.__INITIAL_STATE__.note.noteDetailMap` 提取图片/视频直链与笔记信息(不调用需要签名的内部 API,稳定性更好)
+- 单篇优先通过 MAIN world 读取当前页面已加载的笔记状态；批量下载或页面状态不可用时，通过同源 `fetch` 请求笔记 HTML（自动携带登录 Cookie 和 `xsec_token`）
+- 安全解析 `window.__INITIAL_STATE__`，兼容新版 `new Map([])` / `new Set([])`、裸 `undefined` 和 Vue ref；严格匹配笔记 ID，避免导出其他缓存笔记。解析不执行网页脚本
 - 批量下载时,逐篇笔记的 `xsec_token` 由注入页面 JS 环境的 `main.js` 从页面 state 读取回传(2024 年后小红书笔记链接必须带 token 才能访问)
-- 图片字节优先由后台 Service Worker 抓取(扩展声明了 `xhscdn.com`/`rednotecdn.com` 的 host 权限,不受页面跨域限制,失败时回退页面内直接抓取);CDN 返回的 webp/avif 自动转为 jpg
+- 图片和视频通过后台 Service Worker 抓取官方 CDN（保持原有 `xhscdn.com` / `rednotecdn.com` 权限）。图片限制 20MB / 15 秒，视频限制 256MB / 60 秒；大视频分块传回，CDN 的网页/JSON 错误不会当媒体保存。webp/avif 自动转为 jpg
 - 抓取到的媒体用内置的 `zip.js`(纯原生 ZIP/STORE 实现,无第三方库)打包成单个 zip
 - zip 的 blob URL 交给后台 `chrome.downloads` 落盘,并经 `onDeterminingFilename` 改名到「小红书下载/博主/」子目录(Chrome 会忽略跨上下文 blob URL 的 filename 参数;失败时自动降级为浏览器直接下载)
-- 批量下载时自动滚动博主主页加载全部笔记,逐篇处理并带进度面板,可随时取消
+- 下载面板等待 Chrome 确认文件保存完成，下载中断会显示失败；批量下载滚动收集主页笔记，逐篇处理，可随时取消
 
 环境要求:Chrome 111+(需要 manifest 中的 MAIN world 注入能力)。
 
@@ -66,8 +84,19 @@ xiaohongshu-你好-20260930.zip
 ```
 manifest.json   # 插件清单(MV3)
 background.js   # Service Worker,负责调用 chrome.downloads 落盘
-main.js         # MAIN world 脚本:读取页面 state 中的笔记列表和 xsec_token
+main.js         # MAIN world 只读桥:当前笔记、评论加载状态和主页笔记列表
+data.js         # 共享安全状态解析、数据适配、评论去重与 Markdown 导出
 zip.js          # 纯原生 ZIP 打包(STORE 不压缩 + CRC32,支持中文文件名)
 content.js      # 内容脚本:按钮/进度 UI、笔记数据解析、批量收集与下载流程
 content.css     # 注入页面的 UI 样式
 ```
+
+## 开发验证
+
+无需安装测试依赖，使用 Node.js 20+：
+
+```sh
+node --test tests/*.test.js
+```
+
+测试覆盖新版状态序列化、Vue ref、准确选择笔记、评论层级与去重、媒体下载限制与分块、下载状态、取消和 ZIP 条目。修改后在 `chrome://extensions/` 点击本扩展的“重新加载”，再刷新小红书标签页。
